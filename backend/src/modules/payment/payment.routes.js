@@ -1,41 +1,41 @@
 
-const router = require("express").Router();
+const express = require("express");
+const router = express.Router();
 
 const paymentController = require("./payment.controller");
 
-const {
-  authenticate,
-} = require("../../middleware/auth.middleware");
+const authenticate = require("../../middleware/auth.middleware");
+const authorize = require("../../middleware/role.middleware");
 
-const {
-  authorize,
-} = require("../../middleware/role.middleware");
+router.use(authenticate);
 
-// Public QR payment routes
+// Waiter and Admin can record payments
 router.post(
-  "/razorpay/create",
-  paymentController.createRazorpayOrder
+  "/",
+  authorize("ADMIN", "WAITER"),
+  paymentController.recordPayment
 );
 
-router.post(
-  "/razorpay/verify",
-  paymentController.verifyRazorpayPayment
-);
-
-// Staff payment routes
-router.post(
-  "/offline",
-  authenticate,
-  authorize("WAITER", "ADMIN"),
-  paymentController.recordOfflinePayment
-);
-
-// Payment history
+// Admin can view all payment records
 router.get(
-  "/order/:orderId",
-  authenticate,
+  "/",
   authorize("ADMIN"),
-  paymentController.getOrderPayments
+  paymentController.getAllPayments
 );
+
+// Admin can view individual payment
+router.get(
+  "/:id",
+  authorize("ADMIN"),
+  paymentController.getPaymentById
+);
+
+console.log({
+  authenticate: typeof authenticate,
+  authorize: typeof authorize,
+  recordPayment: typeof paymentController.recordPayment,
+  getAllPayments: typeof paymentController.getAllPayments,
+  getPaymentById: typeof paymentController.getPaymentById
+});
 
 module.exports = router;

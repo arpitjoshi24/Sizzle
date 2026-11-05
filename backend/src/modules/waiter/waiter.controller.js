@@ -15,6 +15,19 @@ const getReadyOrders = async (req, res, next) => {
   }
 };
 
+const getOrderDetails = async (req, res, next) => {
+  try {
+    const order = await waiterService.getOrderDetails(req.params.id);
+
+    res.status(200).json({
+      success: true,
+      data: order,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const markOrderServed = async (req, res, next) => {
   try {
     const order = await waiterService.markOrderServed(
@@ -34,5 +47,6 @@ const markOrderServed = async (req, res, next) => {
 
 module.exports = {
   getReadyOrders,
+  getOrderDetails,
   markOrderServed,
 };

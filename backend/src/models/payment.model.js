@@ -3,73 +3,59 @@ const mongoose = require("mongoose");
 
 const paymentSchema = new mongoose.Schema(
   {
+    paymentNumber: {
+      type: String,
+      required: true,
+      unique: true
+    },
+
     order: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Order",
       required: true,
-      index: true,
-    },
-
-    paymentMethod: {
-      type: String,
-      enum: ["ONLINE", "CASH", "CARD"],
-      required: true,
+      index: true
     },
 
     amount: {
       type: Number,
       required: true,
-      min: 0,
+      min: 0
     },
 
-    paymentStatus: {
+    method: {
       type: String,
-      enum: ["PENDING", "PAID", "FAILED", "REFUNDED"],
-      default: "PENDING",
-      required: true,
+      enum: ["CASH", "CARD"],
+      required: true
     },
 
-    // Razorpay details
-    gatewayOrderId: {
+    status: {
       type: String,
-      default: null,
+      enum: ["SUCCESS", "FAILED", "REFUNDED"],
+      default: "SUCCESS"
     },
 
-    gatewayPaymentId: {
-      type: String,
-      default: null,
-    },
-
-    gatewaySignature: {
-      type: String,
-      default: null,
-      select: false,
-    },
-
-    // Offline payment details
     receivedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      default: null,
+      required: true
     },
 
-    transactionReference: {
+    notes: {
       type: String,
       trim: true,
-      default: "",
+      default: ""
     },
 
     paidAt: {
       type: Date,
-      default: null,
-    },
+      default: Date.now
+    }
   },
   {
-    timestamps: true,
+    timestamps: true
   }
 );
 
-paymentSchema.index({ gatewayOrderId: 1 });
-paymentSchema.index({ gatewayPaymentId: 1 });
+paymentSchema.index({ order: 1, status: 1 });
 
 module.exports = mongoose.model("Payment", paymentSchema);

@@ -1,5 +1,8 @@
 const mongoose = require("mongoose");
 const crypto = require("crypto");
+const OrderHistory = require("../../models/orderHistory.model");
+const Cart = require("../../models/cart.model");
+const TableSession = require("../../models/tableSession.model");
 
 const Order = require("../../models/order.model");
 const Table = require("../../models/table.model");
@@ -104,7 +107,7 @@ exports.createQROrder = async (req, res) => {
       customerPhone,
       subtotal,
       totalAmount: subtotal,
-      paymentMethod: "ONLINE",
+      paymentMethod: null,
       paymentStatus: "PENDING",
       orderStatus: "PENDING_PAYMENT",
       notes
@@ -112,7 +115,7 @@ exports.createQROrder = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Order created. Complete online payment to confirm it.",
+      message: "Order created. Please pay by cash or card to the waiter or at the counter.",
       order: {
         id: order._id,
         orderNumber: order.orderNumber,
@@ -134,6 +137,7 @@ exports.createQROrder = async (req, res) => {
 };
 
 // CREATE ORDER BY WAITER
+
 exports.createWaiterOrder = async (req, res) => {
   try {
     const {
@@ -141,7 +145,6 @@ exports.createWaiterOrder = async (req, res) => {
       items,
       customerName,
       customerPhone,
-      paymentMethod,
       notes
     } = req.body;
 
@@ -149,13 +152,6 @@ exports.createWaiterOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "A valid table ID is required"
-      });
-    }
-
-    if (!["CASH", "CARD"].includes(paymentMethod)) {
-      return res.status(400).json({
-        success: false,
-        message: "Waiter orders must record CASH or CARD payment"
       });
     }
 
@@ -183,15 +179,22 @@ exports.createWaiterOrder = async (req, res) => {
       waiter: req.user.id,
       subtotal,
       totalAmount: subtotal,
-      paymentMethod,
-      paymentStatus: "PAID",
-      orderStatus: "PLACED",
+      paymentMethod: null,
+      paymentStatus: "PENDING",
+      orderStatus: "PENDING_PAYMENT",
       notes
     });
 
-    res.status(201).json({
+    await OrderHistory.create({
+      order: order._id,
+      status: "PENDING_PAYMENT",
+      changedBy: req.user.id,
+      notes: "Waiter created order; awaiting manual payment"
+    });
+
+    return res.status(201).json({
       success: true,
-      message: "Waiter order created and offline payment recorded",
+      message: "Waiter order created. Record cash or card payment to send it to the kitchen.",
       order: {
         id: order._id,
         orderNumber: order.orderNumber,
@@ -206,12 +209,13 @@ exports.createWaiterOrder = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(400).json({
+    return res.status(error.statusCode || 400).json({
       success: false,
       message: error.message
     });
   }
 };
+
 
 // GET ALL ORDERS (ADMIN / WAITER / KITCHEN)
 exports.getAllOrders = async (req, res) => {
@@ -278,5 +282,125 @@ exports.getOrderById = async (req, res) => {
       success: false,
       message: error.message
     });
+  }
+};
+
+
+exports.checkoutCart = async (req, res) => {
+  const sessionToken = req.headers["x-table-session"];
+
+  if (!sessionToken) {
+    return res.status(401).json({
+      success: false,
+      message: "Customer session token is required"
+    });
+  }
+
+  const dbSession = await mongoose.startSession();
+
+  try {
+    let responseOrder;
+
+    await dbSession.withTransaction(async () => {
+      const customerSession = await TableSession.findOne({
+        sessionToken,
+        status: "ACTIVE",
+        expiresAt: { $gt: new Date() }
+      })
+        .select("+sessionToken")
+        .populate("table")
+        .session(dbSession);
+
+      if (
+        !customerSession ||
+        !customerSession.table ||
+        !customerSession.table.isActive
+      ) {
+        const error = new Error("Invalid or expired customer session");
+        error.statusCode = 401;
+        throw error;
+      }
+
+      const cart = await Cart.findOne({
+        session: customerSession._id
+      }).session(dbSession);
+
+      if (!cart || !cart.items.length) {
+        const error = new Error("Your cart is empty");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const { orderItems, subtotal } = await buildOrderItems(
+        cart.items.map(item => ({
+          menuItem: item.menuItem,
+          quantity: item.quantity
+        }))
+      );
+
+      const {
+        customerName = "",
+        customerPhone = "",
+        notes = ""
+      } = req.body;
+
+      const [order] = await Order.create(
+        [{
+          orderNumber: generateOrderNumber(),
+          table: customerSession.table._id,
+          orderSource: "QR",
+          items: orderItems,
+          customerName,
+          customerPhone,
+          subtotal,
+          totalAmount: subtotal,
+          paymentMethod: null,
+          paymentStatus: "PENDING",
+          orderStatus: "PENDING_PAYMENT",
+          notes
+        }],
+        { session: dbSession }
+      );
+
+      await OrderHistory.create(
+        [{
+          order: order._id,
+          status: "PENDING_PAYMENT",
+          changedBy: null,
+          notes: "Customer placed QR order; awaiting manual payment"
+        }],
+        { session: dbSession }
+      );
+
+      cart.items = [];
+      cart.notes = "";
+      await cart.save({ session: dbSession });
+
+      responseOrder = {
+        id: order._id,
+        orderNumber: order.orderNumber,
+        tableNumber: customerSession.table.tableNumber,
+        items: order.items,
+        subtotal: order.subtotal,
+        totalAmount: order.totalAmount,
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        orderStatus: order.orderStatus
+      };
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Order created successfully. Please pay at the counter or to the waiter.",
+      order: responseOrder
+    });
+
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message
+    });
+  } finally {
+    await dbSession.endSession();
   }
 };

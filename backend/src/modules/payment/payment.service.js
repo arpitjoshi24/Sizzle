@@ -1,293 +1,179 @@
-
 const crypto = require("crypto");
-const Razorpay = require("razorpay");
-const mongoose = require("mongoose");
 
-const Order = require("../../models/order.model");
 const Payment = require("../../models/payment.model");
+const Order = require("../../models/order.model");
 const OrderHistory = require("../../models/orderHistory.model");
+const KitchenQueue = require("../../models/kitchenQueue.model");
+const { getIO } = require("../../config/socket");
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const recordPayment = async ({ orderId, method, receivedBy, notes }) => {
+  const dbSession = await Order.startSession();
 
-// Validate MongoDB ID
-const validateId = (id) => {
-  if (!mongoose.Types.ObjectId.isValid(id)) {
-    const error = new Error("Invalid order ID");
-    error.statusCode = 400;
-    throw error;
-  }
-};
+  try {
+    let paymentResult;
+    let orderForEvent;
 
-// Create Razorpay payment order
-const createRazorpayOrder = async (orderId) => {
-  validateId(orderId);
+    await dbSession.withTransaction(async () => {
+      if (!["CASH", "CARD"].includes(method)) {
+        const error = new Error("Payment method must be CASH or CARD");
+        error.statusCode = 400;
+        throw error;
+      }
 
-  const order = await Order.findOne({
-    _id: orderId,
-    orderSource: "QR",
-    paymentMethod: "ONLINE",
-    paymentStatus: "PENDING",
-    orderStatus: "PENDING_PAYMENT",
-  });
+      const order = await Order.findById(orderId).session(dbSession);
 
-  if (!order) {
-    const error = new Error(
-      "Order not found or payment is not pending"
-    );
-    error.statusCode = 404;
-    throw error;
-  }
+      if (!order) {
+        const error = new Error("Order not found");
+        error.statusCode = 404;
+        throw error;
+      }
 
-  // Amount must be sent in paise
-  const amountInPaise = Math.round(order.totalAmount * 100);
+      if (order.paymentStatus === "PAID") {
+        const error = new Error("Order is already paid");
+        error.statusCode = 409;
+        throw error;
+      }
 
-  if (amountInPaise <= 0) {
-    const error = new Error("Invalid payment amount");
-    error.statusCode = 400;
-    throw error;
-  }
+      if (order.orderStatus !== "PENDING_PAYMENT") {
+        const error = new Error("Order is not awaiting payment");
+        error.statusCode = 400;
+        throw error;
+      }
 
-  // Create Razorpay order
-  const razorpayOrder = await razorpay.orders.create({
-    amount: amountInPaise,
-    currency: "INR",
-    receipt: order.orderNumber,
-  });
+      const paymentNumber = `PAY-${Date.now()}-${crypto
+        .randomBytes(3)
+        .toString("hex")
+        .toUpperCase()}`;
 
-  // Save payment record
-  const payment = await Payment.create({
-    order: order._id,
-    paymentMethod: "ONLINE",
-    amount: order.totalAmount,
-    paymentStatus: "PENDING",
-    gatewayOrderId: razorpayOrder.id,
-  });
+      const [payment] = await Payment.create(
+        [
+          {
+            paymentNumber,
+            order: order._id,
+            amount: order.totalAmount,
+            method,
+            status: "SUCCESS",
+            receivedBy,
+            notes: notes || "",
+            paidAt: new Date(),
+          },
+        ],
+        { session: dbSession }
+      );
 
-  return {
-    paymentId: payment._id,
-    razorpayOrderId: razorpayOrder.id,
-    amount: razorpayOrder.amount,
-    currency: razorpayOrder.currency,
-    keyId: process.env.RAZORPAY_KEY_ID,
-  };
-};
+      order.paymentMethod = method;
+      order.paymentStatus = "PAID";
+      order.orderStatus = "PLACED";
 
-// Verify Razorpay payment
-const verifyRazorpayPayment = async ({
-  orderId,
-  razorpay_order_id,
-  razorpay_payment_id,
-  razorpay_signature,
-}) => {
-  validateId(orderId);
+      await order.save({ session: dbSession });
 
-  const order = await Order.findOne({
-    _id: orderId,
-    orderSource: "QR",
-    paymentMethod: "ONLINE",
-    paymentStatus: "PENDING",
-    orderStatus: "PENDING_PAYMENT",
-  });
+      await KitchenQueue.findOneAndUpdate(
+        { order: order._id },
+        {
+          $setOnInsert: {
+            order: order._id,
+            status: "QUEUED",
+            priority: 0,
+          },
+        },
+        {
+          upsert: true,
+          new: true,
+          session: dbSession,
+          runValidators: true,
+          setDefaultsOnInsert: true,
+        }
+      );
 
-  if (!order) {
-    const error = new Error(
-      "Order not found or already processed"
-    );
-    error.statusCode = 409;
-    throw error;
-  }
+      await OrderHistory.create(
+        [
+          {
+            order: order._id,
+            status: "PLACED",
+            changedBy: receivedBy,
+            notes: `Payment received by ${method}; order added to kitchen queue`,
+          },
+        ],
+        { session: dbSession }
+      );
 
-  // Find matching payment record
-  const payment = await Payment.findOne({
-    order: order._id,
-    gatewayOrderId: razorpay_order_id,
-    paymentStatus: "PENDING",
-  });
+      paymentResult = payment;
 
-  if (!payment) {
-    const error = new Error("Payment record not found");
-    error.statusCode = 404;
-    throw error;
-  }
+      orderForEvent = {
+        _id: order._id,
+        orderNumber: order.orderNumber,
+        table: order.table,
+        orderStatus: order.orderStatus,
+        paymentStatus: order.paymentStatus,
+        paymentMethod: order.paymentMethod,
+        totalAmount: order.totalAmount,
+        items: order.items,
+        createdAt: order.createdAt,
+      };
+    });
 
-  // Verify signature using Razorpay secret
-  const body =
-    `${razorpay_order_id}|${razorpay_payment_id}`;
+    // Emit only after the database transaction commits.
+    if (paymentResult && orderForEvent) {
+      const io = getIO();
 
-  const expectedSignature = crypto
-    .createHmac(
-      "sha256",
-      process.env.RAZORPAY_KEY_SECRET
-    )
-    .update(body)
-    .digest("hex");
+      io.to("KITCHEN").emit("order:new", orderForEvent);
+      io.to("ADMIN").emit("order:new", orderForEvent);
 
-  const received = Buffer.from(razorpay_signature, "hex");
-  const expected = Buffer.from(expectedSignature, "hex");
+      io.to("ADMIN").emit("payment:success", {
+        paymentId: paymentResult._id,
+        paymentNumber: paymentResult.paymentNumber,
+        orderId: orderForEvent._id,
+        orderNumber: orderForEvent.orderNumber,
+        amount: paymentResult.amount,
+        method: paymentResult.method,
+        status: paymentResult.status,
+        paidAt: paymentResult.paidAt,
+      });
 
-  if (
-    received.length !== expected.length ||
-    !crypto.timingSafeEqual(received, expected)
-  ) {
-    const error = new Error("Invalid payment signature");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const now = new Date();
-
-  // Atomically change order status
-  const updatedOrder = await Order.findOneAndUpdate(
-    {
-      _id: order._id,
-      paymentStatus: "PENDING",
-      orderStatus: "PENDING_PAYMENT",
-    },
-    {
-      $set: {
-        paymentStatus: "PAID",
-        orderStatus: "PLACED",
-      },
-    },
-    {
-      new: true,
-      runValidators: true,
+      io.to("WAITER").emit("payment:success", {
+        paymentId: paymentResult._id,
+        orderId: orderForEvent._id,
+        orderNumber: orderForEvent.orderNumber,
+        amount: paymentResult.amount,
+        method: paymentResult.method,
+        status: paymentResult.status,
+      });
     }
-  );
 
-  if (!updatedOrder) {
-    const error = new Error(
-      "Order payment has already been processed"
-    );
-    error.statusCode = 409;
-    throw error;
+    return paymentResult;
+  } finally {
+    await dbSession.endSession();
   }
-
-  // Update payment record
-  await Payment.findByIdAndUpdate(payment._id, {
-    $set: {
-      paymentStatus: "PAID",
-      gatewayPaymentId: razorpay_payment_id,
-      gatewaySignature: razorpay_signature,
-      paidAt: now,
-    },
-  });
-
-  // Save order history
-  await OrderHistory.create({
-    order: updatedOrder._id,
-    status: "PLACED",
-    changedBy: null,
-    notes: "Online payment successfully verified",
-    changedAt: now,
-  });
-
-  return updatedOrder;
 };
 
-// Record waiter cash/card payment
-const recordOfflinePayment = async ({
-  orderId,
-  paymentMethod,
-  transactionReference,
-  staffId,
-}) => {
-  validateId(orderId);
+const getAllPayments = async ({ method, status } = {}) => {
+  const filter = {};
 
-  if (!["CASH", "CARD"].includes(paymentMethod)) {
-    const error = new Error(
-      "Payment method must be CASH or CARD"
-    );
-    error.statusCode = 400;
-    throw error;
-  }
+  if (method) filter.method = method;
+  if (status) filter.status = status;
 
-  const order = await Order.findOne({
-    _id: orderId,
-    orderSource: "WAITER",
-    paymentStatus: "PENDING",
-    orderStatus: "PENDING_PAYMENT",
-  });
-
-  if (!order) {
-    const error = new Error(
-      "Order not found or payment already processed"
-    );
-    error.statusCode = 409;
-    throw error;
-  }
-
-  const now = new Date();
-
-  // Atomically update order
-  const updatedOrder = await Order.findOneAndUpdate(
-    {
-      _id: order._id,
-      paymentStatus: "PENDING",
-      orderStatus: "PENDING_PAYMENT",
-    },
-    {
-      $set: {
-        paymentMethod,
-        paymentStatus: "PAID",
-        orderStatus: "PLACED",
-        statusUpdatedBy: staffId,
-      },
-    },
-    {
-      new: true,
-      runValidators: true,
-    }
-  );
-
-  if (!updatedOrder) {
-    const error = new Error(
-      "Payment has already been recorded"
-    );
-    error.statusCode = 409;
-    throw error;
-  }
-
-  // Create offline payment record
-  await Payment.create({
-    order: updatedOrder._id,
-    paymentMethod,
-    amount: updatedOrder.totalAmount,
-    paymentStatus: "PAID",
-    receivedBy: staffId,
-    transactionReference: transactionReference || "",
-    paidAt: now,
-  });
-
-  // Record order history
-  await OrderHistory.create({
-    order: updatedOrder._id,
-    status: "PLACED",
-    changedBy: staffId,
-    notes: `${paymentMethod} payment received by waiter`,
-    changedAt: now,
-  });
-
-  return updatedOrder;
-};
-
-// Get payments for an order
-const getOrderPayments = async (orderId) => {
-  validateId(orderId);
-
-  return await Payment.find({
-    order: orderId,
-  })
-    .populate("receivedBy", "name")
+  return Payment.find(filter)
+    .populate("order", "orderNumber totalAmount orderStatus")
+    .populate("receivedBy", "name email")
     .sort({ createdAt: -1 });
 };
 
+const getPaymentById = async (paymentId) => {
+  const payment = await Payment.findById(paymentId)
+    .populate("order", "orderNumber totalAmount orderStatus")
+    .populate("receivedBy", "name email");
+
+  if (!payment) {
+    const error = new Error("Payment not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  return payment;
+};
+
 module.exports = {
-  createRazorpayOrder,
-  verifyRazorpayPayment,
-  recordOfflinePayment,
-  getOrderPayments,
+  recordPayment,
+  getAllPayments,
+  getPaymentById,
 };

@@ -1,4 +1,3 @@
-
 const mongoose = require("mongoose");
 const orderItemSchema = require("./orderItem.model");
 
@@ -63,13 +62,14 @@ const orderSchema = new mongoose.Schema(
 
     paymentMethod: {
       type: String,
-      enum: ["ONLINE", "CASH", "CARD"],
-      required: true,
+      enum: ["CASH", "CARD"],
+      default: null,
     },
 
     paymentStatus: {
       type: String,
       enum: ["PENDING", "PAID", "FAILED", "REFUNDED"],
+      default: "PENDING",
       required: true,
     },
 
@@ -83,8 +83,8 @@ const orderSchema = new mongoose.Schema(
         "SERVED",
         "CANCELLED",
       ],
-      required: true,
       default: "PENDING_PAYMENT",
+      required: true,
     },
 
     notes: {
@@ -93,31 +93,26 @@ const orderSchema = new mongoose.Schema(
       default: "",
     },
 
-    // Kitchen preparation started
     kitchenStartedAt: {
       type: Date,
       default: null,
     },
 
-    // Kitchen completed preparation
     readyAt: {
       type: Date,
       default: null,
     },
 
-    // Waiter served the order
     servedAt: {
       type: Date,
       default: null,
     },
 
-    // Order cancellation
     cancelledAt: {
       type: Date,
       default: null,
     },
 
-    // Staff member who last updated order status
     statusUpdatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -129,7 +124,6 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
-// Indexes
 orderSchema.index({
   orderStatus: 1,
   paymentStatus: 1,

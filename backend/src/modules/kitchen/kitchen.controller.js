@@ -1,60 +1,42 @@
 
 const kitchenService = require("./kitchen.service");
 
-// Get kitchen orders
-const getKitchenOrders = async (req, res, next) => {
+exports.getKitchenQueue = async (req, res) => {
   try {
-    const orders = await kitchenService.getKitchenOrders();
+    const queue = await kitchenService.getKitchenQueue();
+
+    const visibleQueue = queue.filter((entry) => entry.order);
 
     return res.status(200).json({
       success: true,
-      message: "Kitchen orders fetched successfully",
-      count: orders.length,
-      data: orders,
+      count: visibleQueue.length,
+      queue: visibleQueue
     });
   } catch (error) {
-    next(error);
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 };
 
-// Start preparing
-const startPreparingOrder = async (req, res, next) => {
+exports.updateKitchenStatus = async (req, res) => {
   try {
-    const order = await kitchenService.startPreparingOrder(
-      req.params.id,
-      req.user.id
-    );
+    const queue = await kitchenService.updateKitchenStatus({
+      queueId: req.params.id,
+      status: req.body.status,
+      userId: req.user.id
+    });
 
     return res.status(200).json({
       success: true,
-      message: "Order preparation started",
-      data: order,
+      message: `Kitchen order marked ${queue.status}`,
+      queue
     });
   } catch (error) {
-    next(error);
-  }
-};
-
-// Mark order ready
-const markOrderReady = async (req, res, next) => {
-  try {
-    const order = await kitchenService.markOrderReady(
-      req.params.id,
-      req.user.id
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: "Order marked as READY",
-      data: order,
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message
     });
-  } catch (error) {
-    next(error);
   }
-};
-
-module.exports = {
-  getKitchenOrders,
-  startPreparingOrder,
-  markOrderReady,
 };
